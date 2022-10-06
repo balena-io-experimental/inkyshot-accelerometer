@@ -3,6 +3,10 @@ services:
   inkyshot:
     build:
       context: ./inkyshot
+    environment:
+      DEBUG: true
+      INKY_MESSAGE: "Hello Hello."
+      MODE: 'weather'
     privileged: true
     labels:
       io.balena.features.balena-api: '1'

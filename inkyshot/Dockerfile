@@ -23,15 +23,14 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY start.sh .
-COPY run-update.sh .
 COPY lib lib
 COPY fonts fonts
 COPY weather-icons weather-icons
 
 RUN chmod +x start.sh
-RUN chmod +x run-update.sh
 
 COPY update-display.py .
+# COPY sample.py .
 
 CMD ["/bin/bash","start.sh"]
 

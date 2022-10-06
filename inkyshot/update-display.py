@@ -21,6 +21,14 @@ import arrow
 import geocoder
 import requests
 
+# LIS3DH Accelerometer
+import board
+import digitalio
+import adafruit_lis3dh
+# i2c = board.I2C()
+# int1 = digitalio.DigitalInOut(board.D6)  # Set this to the correct pin for the interrupt!
+# lis3dh = adafruit_lis3dh.LIS3DH_I2C(i2c, int1=int1)
+
 icon_map = {
     "clearsky": 1,
     "cloudy": 4,
@@ -64,6 +72,86 @@ icon_map = {
     "snowshowers": 8,
     "snowshowersandthunder": 21,
 }
+
+# Read the preset environment variables and overwrite the default ones
+if "DEBUG" in os.environ:
+    logging.basicConfig(level=logging.DEBUG)
+else:
+    logging.basicConfig(level=logging.INFO)
+
+# Assume a default font if none set
+FONT_SELECTED = AmaticSC
+if "FONT" in os.environ:
+    FONT_SELECTED = locals()[os.environ["FONT"]]
+
+FONT_SIZE = 24
+if "FONT_SIZE" in os.environ:
+    FONT_SIZE = int(os.environ["FONT_SIZE"])
+
+# Check for a quote of the day category, otherwise use inspire
+CATEGORY = "inspire"
+if "QOD_CATEGORY" in os.environ:
+    CATEGORY = os.environ['QOD_CATEGORY']
+
+# Check for a quote of the day language. ** Note: Only English is supported currently. **
+LANGUAGE = "en"
+if "QOD_LANGUAGE" in os.environ:
+    LANGUAGE = os.environ['QOD_LANGUAGE']
+
+FONT = ImageFont.truetype(FONT_SELECTED, FONT_SIZE)
+
+WEATHER_FONT = FredokaOne
+if "WEATHER_FONT" in os.environ:
+    WEATHER_FONT = locals()[os.environ["WEATHER_FONT"]]
+
+WEATHER_INVERT = True if "WEATHER_INVERT" in os.environ else False
+
+[LAT, LONG] = [float(x) for x in os.environ["LATLONG"].split(",")] if "LATLONG" in os.environ else [None, None]
+
+# Temperature scale
+SCALE = 'F' if "SCALE" in os.environ and os.environ["SCALE"] == 'F' else 'C'
+
+# Locale formatting of date
+LOCALE = os.environ["LOCALE"] if "LOCALE" in os.environ else 'en'
+
+# Display mode of Inkyshot
+MODE = os.environ["MODE"] if "MODE" in os.environ else 'quote'
+
+WAVESHARE = True if "WAVESHARE" in os.environ else False
+
+# Read balena variables for balena API calls
+BALENA_API_KEY = os.environ["BALENA_API_KEY"]
+BALENA_DEVICE_UUID = os.environ["BALENA_DEVICE_UUID"]
+BALENA_SUPERVISOR_ADDRESS = os.environ["BALENA_SUPERVISOR_ADDRESS"]
+BALENA_SUPERVISOR_API_KEY = os.environ["BALENA_SUPERVISOR_API_KEY"]
+
+# Init the display. TODO: support other colours
+logging.debug("Init and Clear")
+if WAVESHARE:
+    logging.info("Display type: Waveshare")
+
+    import lib.epd2in13_V2
+    display = lib.epd2in13_V2.EPD()
+    display.init(display.FULL_UPDATE)
+    display.Clear(0xFF)
+    # These are the opposite of what InkyPhat uses.
+    WIDTH = display.height # yes, Height
+    HEIGHT = display.width # yes, width
+    BLACK = 0
+    WHITE = 1
+    img = Image.new('1', (WIDTH, HEIGHT), 255)
+else:
+    import inky
+    display = inky.auto()
+    logging.info("Display type: " + type(display).__name__)
+    display.set_border(display.WHITE)
+    WIDTH = display.WIDTH
+    HEIGHT = display.HEIGHT
+    BLACK = display.BLACK
+    WHITE = display.WHITE
+    img = Image.new("P", (WIDTH, HEIGHT))
+
+draw = ImageDraw.Draw(img)
 
 def create_mask(source):
     """Create a transparency mask to draw images in grayscale
@@ -230,202 +318,151 @@ def temp_to_str(temp, scale):
         temp = temp * 9/5 + 32
     return f"{temp:.1f}"
 
-# Read the preset environment variables and overwrite the default ones
-if "DEBUG" in os.environ:
-    logging.basicConfig(level=logging.DEBUG)
-else:
-    logging.basicConfig(level=logging.INFO)
+def update_inkyshot():
+    global FONT_SIZE
+    global LAT
+    global LONG
+    global img
 
-# Assume a default font if none set
-FONT_SELECTED = AmaticSC
-if "FONT" in os.environ:
-    FONT_SELECTED = locals()[os.environ["FONT"]]
+    logging.info("Display dimensions: W %s x H %s", WIDTH, HEIGHT)
 
-FONT_SIZE = 24
-if "FONT_SIZE" in os.environ:
-    FONT_SIZE = int(os.environ["FONT_SIZE"])
+    # Reason the display mode based on environment variables and the current display (logic is explained in the readme)
+    current_display = get_current_display()
+    target_display = 'quote'
+    if MODE == 'weather'  or (MODE == 'alternate' and current_display == 'quote'):
+        target_display = 'weather'
 
-# Check for a quote of the day category, otherwise use inspire
-CATEGORY = "inspire"
-if "QOD_CATEGORY" in os.environ:
-    CATEGORY = os.environ['QOD_CATEGORY']
+    if target_display == 'weather':
+        weather_location = None
+        if "WEATHER_LOCATION" in os.environ:
+            weather_location = os.environ["WEATHER_LOCATION"]
+        # Get the latitute and longitude of the address typed in the env variable if latitude and longitude are not set
+        if weather_location and (not LAT or not LONG):
+            logging.info(f"Location is set to {weather_location}")
+            try:
+                geo = geocoder.arcgis(weather_location)
+                [LAT, LONG] = geo.latlng
+            except Exception as e:
+                print(f"Unexpected error: {e.message}")
 
-# Check for a quote of the day language. ** Note: Only English is supported currently. **
-LANGUAGE = "en"
-if "QOD_LANGUAGE" in os.environ:
-    LANGUAGE = os.environ['QOD_LANGUAGE']
+        # If no address or latitute / longitude are found, retrieve location via IP address lookup
+        if not LAT or not LONG:
+            location = get_location()
+            [LAT, LONG] = [float(x) for x in location['loc'].split(',')]
+        weather = get_weather(LAT, LONG)
+        # Set latitude and longituted as environment variables for consecutive calls
+        os.environ['LATLONG'] = f"{LAT},{LONG}"
+        # If weather is empty dictionary, fall back to drawing quote
+        if len(weather) > 0:
+            img = draw_weather(weather, img, SCALE)
+        else:
+            target_display = 'quote'
+    elif target_display == 'quote':
+        # Use a dashboard defined message if we have one, otherwise load a nice quote
+        message = os.environ['INKY_MESSAGE'] if 'INKY_MESSAGE' in os.environ else None
+        # If message was set but blank, use the device name
+        if message == "":
+            message = os.environ['DEVICE_NAME']
+        elif message is None:
+            try:
+                response = requests.get(
+                    f"https://quotes.rest/qod?category={CATEGORY}&language={LANGUAGE}",
+                    headers={"Accept" : "application/json"}
+                )
+                data = response.json()
+                logging.info(data)
+                message = data['contents']['quotes'][0]['quote']
+            except requests.exceptions.RequestException as err:
+                logging.error(err)
+                FONT_SIZE = 25
+                message = "Sorry folks, today's quote has gone walkies :("
 
-FONT = ImageFont.truetype(FONT_SELECTED, FONT_SIZE)
+        logging.info("Message: %s", message)
+        # Work out what size font is required to fit this message on the display
+        message_does_not_fit = True
 
-WEATHER_FONT = FredokaOne
-if "WEATHER_FONT" in os.environ:
-    WEATHER_FONT = locals()[os.environ["WEATHER_FONT"]]
+        test_character = "a"
+        if "TEST_CHARACTER" in os.environ:
+            test_character = os.environ['TEST_CHARACTER']
 
-WEATHER_INVERT = True if "WEATHER_INVERT" in os.environ else False
+        while message_does_not_fit == True:
+            test_message = ""
+            message_width = 0
+            FONT_SIZE -= 1
 
-[LAT, LONG] = [float(x) for x in os.environ["LATLONG"].split(",")] if "LATLONG" in os.environ else [None, None]
+            if FONT_SIZE <= 17:
+                FONT_SIZE = 8
+                FONT = ImageFont.truetype("/usr/app/fonts/Grand9KPixel.ttf", FONT_SIZE)
 
-# Temperature scale
-SCALE = 'F' if "SCALE" in os.environ and os.environ["SCALE"] == 'F' else 'C'
+            # We're using the test character here to work out how many characters
+            # can fit on the display when using the chosen font
+            while message_width < WIDTH:
+                test_message += test_character
+                message_width, message_height = draw.textsize(test_message, font=FONT)
 
-# Locale formatting of date
-LOCALE = os.environ["LOCALE"] if "LOCALE" in os.environ else 'en'
+            max_width = len(test_message)
+            max_lines = math.floor(HEIGHT/message_height)
 
-# Display mode of Inkyshot
-MODE = os.environ["MODE"] if "MODE" in os.environ else 'quote'
+            # We wrap the message to the width we worked out earlier
+            wrapper = textwrap.TextWrapper(width=max_width)
+            word_list = wrapper.wrap(text=message)
 
-# Read balena variables for balena API calls
-BALENA_API_KEY = os.environ["BALENA_API_KEY"]
-BALENA_DEVICE_UUID = os.environ["BALENA_DEVICE_UUID"]
-BALENA_SUPERVISOR_ADDRESS = os.environ["BALENA_SUPERVISOR_ADDRESS"]
-BALENA_SUPERVISOR_API_KEY = os.environ["BALENA_SUPERVISOR_API_KEY"]
+            if len(word_list) <= max_lines:
+                message_does_not_fit = False
 
-WAVESHARE = True if "WAVESHARE" in os.environ else False
+            if FONT_SIZE < 9:
+                message_does_not_fit = False
 
-# Init the display. TODO: support other colours
-logging.debug("Init and Clear")
-if WAVESHARE:
-    logging.info("Display type: Waveshare")
+        logging.info("Font size: %s", FONT_SIZE)
+        offset_x, offset_y = FONT.getoffset(message)
 
-    import lib.epd2in13_V2
-    display = lib.epd2in13_V2.EPD()
-    display.init(display.FULL_UPDATE)
-    display.Clear(0xFF)
-    # These are the opposite of what InkyPhat uses.
-    WIDTH = display.height # yes, Height
-    HEIGHT = display.width # yes, width
-    BLACK = 0
-    WHITE = 1
-    img = Image.new('1', (WIDTH, HEIGHT), 255)
-else:
-    import inky
-    display = inky.auto()
-    logging.info("Display type: " + type(display).__name__)
-    display.set_border(display.WHITE)
-    WIDTH = display.WIDTH
-    HEIGHT = display.HEIGHT
-    BLACK = display.BLACK
-    WHITE = display.WHITE
-    img = Image.new("P", (WIDTH, HEIGHT))
+        # Rejoin the wrapped lines with newline chars
+        separator = '\n'
+        output_text = separator.join(word_list)
 
-draw = ImageDraw.Draw(img)
+        w, h = draw.multiline_textsize(output_text, font=FONT, spacing=0)
 
-logging.info("Display dimensions: W %s x H %s", WIDTH, HEIGHT)
+        x = (WIDTH - w)/2
+        y = (HEIGHT - h - offset_y)/2
+        draw.multiline_text((x, y), output_text, BLACK, FONT, align="center", spacing=0)
 
-# Reason the display mode based on environment variables and the current display (logic is explained in the readme)
-current_display = get_current_display()
-target_display = 'quote'
-if MODE == 'weather'  or (MODE == 'alternate' and current_display == 'quote'):
-    target_display = 'weather'
+    # Rotate and display the image
+    if "ROTATE" in os.environ:
+        img = img.rotate(180)
 
-if target_display == 'weather':
-    weather_location = None
-    if "WEATHER_LOCATION" in os.environ:
-        weather_location = os.environ["WEATHER_LOCATION"]
-    # Get the latitute and longitude of the address typed in the env variable if latitude and longitude are not set
-    if weather_location and (not LAT or not LONG):
-        logging.info(f"Location is set to {weather_location}")
-        try:
-            geo = geocoder.arcgis(weather_location)
-            [LAT, LONG] = geo.latlng
-        except Exception as e:
-            print(f"Unexpected error: {e.message}")
-
-    # If no address or latitute / longitude are found, retrieve location via IP address lookup
-    if not LAT or not LONG:
-        location = get_location()
-        [LAT, LONG] = [float(x) for x in location['loc'].split(',')]
-    weather = get_weather(LAT, LONG)
-    # Set latitude and longituted as environment variables for consecutive calls
-    os.environ['LATLONG'] = f"{LAT},{LONG}"
-    # If weather is empty dictionary, fall back to drawing quote
-    if len(weather) > 0:
-        img = draw_weather(weather, img, SCALE)
+    if WAVESHARE:
+        # epd does not have a set_image method.
+        display.display(display.getbuffer(img))
     else:
-        target_display = 'quote'
-elif target_display == 'quote':
-    # Use a dashboard defined message if we have one, otherwise load a nice quote
-    message = os.environ['INKY_MESSAGE'] if 'INKY_MESSAGE' in os.environ else None
-    # If message was set but blank, use the device name
-    if message == "":
-        message = os.environ['DEVICE_NAME']
-    elif message is None:
-        try:
-            response = requests.get(
-                f"https://quotes.rest/qod?category={CATEGORY}&language={LANGUAGE}",
-                headers={"Accept" : "application/json"}
-            )
-            data = response.json()
-            message = data['contents']['quotes'][0]['quote']
-        except requests.exceptions.RequestException as err:
-            logging.error(err)
-            FONT_SIZE = 25
-            message = "Sorry folks, today's quote has gone walkies :("
+        display.set_image(img)
+        display.show()
 
-    logging.info("Message: %s", message)
-    # Work out what size font is required to fit this message on the display
-    message_does_not_fit = True
+    logging.info("Done drawing")
 
-    test_character = "a"
-    if "TEST_CHARACTER" in os.environ:
-        test_character = os.environ['TEST_CHARACTER']
+    # Update device with the current display for ALTERNATE mode
+    if MODE == 'alternate':
+        set_current_display(target_display)
 
-    while message_does_not_fit == True:
-        test_message = ""
-        message_width = 0
-        FONT_SIZE -= 1
+def main():
+    global MODE
+    logging.info("I'm okay.")
+    while True:
+        # update_inkyshot()
+        # if lis3dh.shake(shake_threshold=10):
+        #     MODE = 'quote'
+        #     update_inkyshot()
+        #     time.sleep(5)
+        # elif lis3dh.tapped:
+        #     print("Tapped!")
+        #     time.sleep(0.01)
+        # print('tapped: ' + str(lis3dh.tapped))
+        # x, y, z = lis3dh.acceleration
+        # print(x, y, z)
+        MODE = 'weather'
+        update_inkyshot()
+        time.sleep(5)
 
-        if FONT_SIZE <= 17:
-            FONT_SIZE = 8
-            FONT = ImageFont.truetype("/usr/app/fonts/Grand9KPixel.ttf", FONT_SIZE)
-
-        # We're using the test character here to work out how many characters
-        # can fit on the display when using the chosen font
-        while message_width < WIDTH:
-            test_message += test_character
-            message_width, message_height = draw.textsize(test_message, font=FONT)
-
-        max_width = len(test_message)
-        max_lines = math.floor(HEIGHT/message_height)
-
-        # We wrap the message to the width we worked out earlier
-        wrapper = textwrap.TextWrapper(width=max_width)
-        word_list = wrapper.wrap(text=message)
-
-        if len(word_list) <= max_lines:
-            message_does_not_fit = False
-
-        if FONT_SIZE < 9:
-            message_does_not_fit = False
-
-    logging.info("Font size: %s", FONT_SIZE)
-    offset_x, offset_y = FONT.getoffset(message)
-
-    # Rejoin the wrapped lines with newline chars
-    separator = '\n'
-    output_text = separator.join(word_list)
-
-    w, h = draw.multiline_textsize(output_text, font=FONT, spacing=0)
-
-    x = (WIDTH - w)/2
-    y = (HEIGHT - h - offset_y)/2
-    draw.multiline_text((x, y), output_text, BLACK, FONT, align="center", spacing=0)
-
-# Rotate and display the image
-if "ROTATE" in os.environ:
-    img = img.rotate(180)
-
-if WAVESHARE:
-    # epd does not have a set_image method.
-    display.display(display.getbuffer(img))
-else:
-    display.set_image(img)
-    display.show()
-
-logging.info("Done drawing")
-
-# Update device with the current display for ALTERNATE mode
-if MODE == 'alternate':
-    set_current_display(target_display)
+if __name__ == '__main__':
+    main()
 
 sys.exit(0)
